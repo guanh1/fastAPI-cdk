@@ -18,7 +18,13 @@ class InfrastructureStack(Stack):
         src_path = os.path.join(project_root, "src")
 
         # Create ECS Cluster
-        cluster = ecr_assets.DockerImageAsset(
+        cluster = ecs.Cluster(
+            self,
+            "FastApiCluster",
+        )
+
+        # Build Docker image
+        docker_image = ecr_assets.DockerImageAsset(
             self,
             "FastApiImage",
             directory=src_path,
@@ -26,20 +32,17 @@ class InfrastructureStack(Stack):
             platform=ecr_assets.Platform.LINUX_AMD64,
         )
 
-        # Build Docker image
-        docker_image = ecr_assets.DockerImageAsset(
-            self, "FastApiImage", directory=src_path
-        )
-
-        # Create Fargate Service using higher-level construct
+        # Create Fargate Service
         fargate_service = ecs_patterns.ApplicationLoadBalancedFargateService(
             self,
             "FastApiService",
             cluster=cluster,
-            task_image_options={
-                "image": ecs.ContainerImage.from_docker_image_asset(docker_image),
-                "container_port": 80,
-            },
+            memory_limit_mib=1024,
+            cpu=512,
+            task_image_options=ecs_patterns.ApplicationLoadBalancedTaskImageOptions(
+                image=ecs.ContainerImage.from_docker_image_asset(docker_image),
+                container_port=80,
+            ),
             public_load_balancer=True,
         )
 
