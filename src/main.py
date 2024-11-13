@@ -1,4 +1,4 @@
-# main.py
+# src/main.py
 from fastapi import FastAPI
 
 app = FastAPI(title="Backend API")
