@@ -1,12 +1,11 @@
-# infrastructure/infrastructure/infrastructure_stack.py
 from aws_cdk import (
     Stack,
-    Duration,
     aws_ec2 as ec2,
     aws_ecs as ecs,
     aws_ecs_patterns as ecs_patterns,
-    aws_events as events,
-    aws_events_targets as targets,
+    aws_ecr_assets as ecr_assets,
+    CfnOutput,
+    Duration,
 )
 from constructs import Construct
 import os
@@ -16,51 +15,75 @@ class InfrastructureStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        # Get the project root and src path
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         src_path = os.path.join(project_root, "src")
 
-        # VPC
+        # Create VPC
         vpc = ec2.Vpc(
             self,
-            "FastApiVPC",
+            "FastApiVpc",
             max_azs=2,
             nat_gateways=1,
+            vpc_name="fastapi-vpc",
             subnet_configuration=[
                 ec2.SubnetConfiguration(
-                    name="PublicSubnet", subnet_type=ec2.SubnetType.PUBLIC, cidr_mask=24
+                    name="Public", subnet_type=ec2.SubnetType.PUBLIC, cidr_mask=24
                 ),
                 ec2.SubnetConfiguration(
-                    name="PrivateSubnet",
+                    name="Private",
                     subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
                     cidr_mask=24,
                 ),
             ],
         )
 
-        # ECS Cluster
+        # Create ECS Cluster
         cluster = ecs.Cluster(
-            self, "FastApiCluster", vpc=vpc, cluster_name="fastapi-cluster"
+            self,
+            "FastApiCluster",
+            vpc=vpc,
+            container_insights=True,
+            cluster_name="fastapi-cluster",
         )
 
-        # Fargate Service
+        # Build Docker image
+        image = ecr_assets.DockerImageAsset(
+            self, "FastApiImage", directory=src_path, file="Dockerfile"
+        )
+
+        # Create Fargate Service with Application Load Balancer
         fargate_service = ecs_patterns.ApplicationLoadBalancedFargateService(
             self,
             "FastApiService",
             cluster=cluster,
-            cpu=256,
-            memory_limit_mib=512,
-            desired_count=1,
+            cpu=256,  # .25 vCPU
+            memory_limit_mib=512,  # 0.5 GB
+            desired_count=2,  # Number of instances of the task to place and keep running
             task_image_options=ecs_patterns.ApplicationLoadBalancedTaskImageOptions(
-                image=ecs.ContainerImage.from_asset(src_path),
+                image=ecs.ContainerImage.from_docker_image_asset(image),
                 container_port=80,
+                environment={
+                    "ENVIRONMENT": "production",
+                    # Add other environment variables as needed
+                },
             ),
-            public_load_balancer=True,
+            public_load_balancer=True,  # Internet facing load balancer
+            load_balancer_name="fastapi-alb",
+            service_name="fastapi-service",
         )
 
-        # Auto Scaling
+        # Configure health check
+        fargate_service.target_group.configure_health_check(
+            path="/",
+            healthy_http_codes="200",
+            interval=Duration.seconds(60),
+            timeout=Duration.seconds(5),
+        )
+
+        # Configure Auto Scaling
         scaling = fargate_service.service.auto_scale_task_count(
-            max_capacity=2,
-            min_capacity=1,
+            max_capacity=4, min_capacity=2
         )
 
         scaling.scale_on_cpu_utilization(
@@ -70,42 +93,10 @@ class InfrastructureStack(Stack):
             scale_out_cooldown=Duration.seconds(60),
         )
 
-        # Start rule
-        start_rule = events.Rule(
+        # Output the Load Balancer DNS name
+        CfnOutput(
             self,
-            "StartRule",
-            schedule=events.Schedule.cron(hour="7", minute="0"),
-        )
-
-        start_rule.add_target(
-            targets.EcsTask(
-                cluster=cluster,
-                task_definition=fargate_service.task_definition,
-                security_groups=[
-                    fargate_service.service.connections.security_groups[0]
-                ],
-                subnet_selection=ec2.SubnetSelection(
-                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
-                ),
-            )
-        )
-
-        # Stop rule
-        stop_rule = events.Rule(
-            self,
-            "StopRule",
-            schedule=events.Schedule.cron(hour="19", minute="0"),
-        )
-
-        stop_rule.add_target(
-            targets.EcsTask(
-                cluster=cluster,
-                task_definition=fargate_service.task_definition,
-                security_groups=[
-                    fargate_service.service.connections.security_groups[0]
-                ],
-                subnet_selection=ec2.SubnetSelection(
-                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
-                ),
-            )
+            "LoadBalancerDNS",
+            value=fargate_service.load_balancer.load_balancer_dns_name,
+            description="The DNS name of the load balancer",
         )
