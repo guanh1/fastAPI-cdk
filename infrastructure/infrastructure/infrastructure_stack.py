@@ -1,79 +1,136 @@
 from aws_cdk import (
     Stack,
-    aws_ecs as ecs,
-    aws_ecs_patterns as ecs_patterns,
-    aws_ecr_assets as ecr_assets,
-    aws_applicationautoscaling as appscaling,
+    aws_ec2 as ec2,
+    aws_iam as iam,
+    aws_s3 as s3,
+    aws_s3_deployment as s3deploy,
     CfnOutput,
+    RemovalPolicy,
 )
 from constructs import Construct
-import os
 
 
 class InfrastructureStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # Get the project root and src path
-        project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        src_path = os.path.join(project_root, "src")
-
-        # Create ECS Cluster
-        cluster = ecs.Cluster(
+        # Create S3 bucket for source code
+        source_bucket = s3.Bucket(
             self,
-            "FastApiCluster",
+            "SourceCodeBucket",
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
         )
 
-        # Build Docker image
-        docker_image = ecr_assets.DockerImageAsset(
+        # Deploy source code to S3
+        s3deploy.BucketDeployment(
             self,
-            "FastApiImage",
-            directory=src_path,
-            file="Dockerfile",
-            platform=ecr_assets.Platform.LINUX_AMD64,
+            "DeploySource",
+            sources=[s3deploy.Source.asset("../src")],
+            destination_bucket=source_bucket,
         )
 
-        # Create Fargate Service
-        fargate_service = ecs_patterns.ApplicationLoadBalancedFargateService(
+        # Create VPC
+        vpc = ec2.Vpc(
             self,
-            "FastApiService",
-            cluster=cluster,
-            memory_limit_mib=1024,
-            cpu=512,
-            desired_count=1,
-            task_image_options=ecs_patterns.ApplicationLoadBalancedTaskImageOptions(
-                image=ecs.ContainerImage.from_docker_image_asset(docker_image),
-                container_port=80,
+            "SimpleVPC",
+            max_azs=2,
+            nat_gateways=1,
+            subnet_configuration=[
+                ec2.SubnetConfiguration(
+                    name="Public", subnet_type=ec2.SubnetType.PUBLIC, cidr_mask=24
+                ),
+                ec2.SubnetConfiguration(
+                    name="Private",
+                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
+                    cidr_mask=24,
+                ),
+            ],
+        )
+
+        # Create security group
+        security_group = ec2.SecurityGroup(
+            self,
+            "WebServerSG",
+            vpc=vpc,
+            allow_all_outbound=True,
+            description="Security group for web server",
+        )
+
+        security_group.add_ingress_rule(
+            ec2.Peer.any_ipv4(), ec2.Port.tcp(80), "Allow HTTP traffic"
+        )
+        security_group.add_ingress_rule(
+            ec2.Peer.any_ipv4(), ec2.Port.tcp(22), "Allow SSH traffic"
+        )
+
+        # IAM role for EC2
+        role = iam.Role(
+            self, "EC2Role", assumed_by=iam.ServicePrincipal("ec2.amazonaws.com")
+        )
+
+        # Add permissions for ECR, CloudWatch and S3
+        role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name(
+                "AmazonEC2ContainerRegistryFullAccess"
+            )
+        )
+        role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name("CloudWatchLogsFullAccess")
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:ListBucket"],
+                resources=[source_bucket.bucket_arn, f"{source_bucket.bucket_arn}/*"],
+            )
+        )
+
+        # User data script to install and configure Docker
+        user_data = ec2.UserData.for_linux()
+        user_data.add_commands(
+            # 安装基本工具
+            "yum update -y",
+            "yum install -y docker git aws-cli",
+            "systemctl start docker",
+            "systemctl enable docker",
+            "usermod -a -G docker ec2-user",
+            # 创建应用目录
+            "mkdir -p /app",
+            "cd /app",
+            # 从S3下载源代码
+            f"aws s3 cp s3://{source_bucket.bucket_name}/ . --recursive",
+            # 构建和运行Docker容器
+            "docker build -t backend-app .",
+            "docker run -d -p 80:80 backend-app",
+        )
+
+        # Create EC2 instance
+        instance = ec2.Instance(
+            self,
+            "WebServer",
+            vpc=vpc,
+            instance_type=ec2.InstanceType.of(
+                ec2.InstanceClass.T3, ec2.InstanceSize.SMALL
             ),
-            public_load_balancer=True,
+            machine_image=ec2.AmazonLinuxImage(
+                generation=ec2.AmazonLinuxGeneration.AMAZON_LINUX_2
+            ),
+            security_group=security_group,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
+            role=role,
+            user_data=user_data,
         )
 
-        # Create scaling target
-        # https://docs.aws.amazon.com/cdk/api/v2/python/aws_cdk.aws_applicationautoscaling/ScalingSchedule.html
-        scalable_target = fargate_service.service.auto_scale_task_count(
-            min_capacity=0,
-            max_capacity=1,
-        )
-
-        # Schedule scaling
-        scalable_target.scale_on_schedule(
-            "ScaleUpAtMorning",
-            schedule=appscaling.Schedule.cron(hour="22", minute="0"),
-            min_capacity=1,
-        )
-
-        scalable_target.scale_on_schedule(
-            "ScaleDownAtEvening",
-            schedule=appscaling.Schedule.cron(hour="8", minute="0"),
-            min_capacity=0,
-        )
-
-        self.api_url = fargate_service.load_balancer.load_balancer_dns_name
-
-        # Output the load balancer DNS name
+        # Output the public IP and bucket name
         CfnOutput(
             self,
-            "LoadBalancerDNS",
-            value=self.api_url,
-            description="Load balancer DNS name",
+            "InstancePublicIP",
+            value=instance.instance_public_ip,
+            description="Public IP of the EC2 instance",
+        )
+        CfnOutput(
+            self,
+            "SourceBucketName",
+            value=source_bucket.bucket_name,
+            description="Name of the S3 bucket containing source code",
         )
