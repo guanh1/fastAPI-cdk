@@ -4,6 +4,9 @@ from aws_cdk import (
     aws_iam as iam,
     aws_s3 as s3,
     aws_s3_deployment as s3deploy,
+    aws_autoscaling as autoscaling,
+    aws_elasticloadbalancingv2 as elbv2,
+    Duration,
     CfnOutput,
     RemovalPolicy,
 )
@@ -30,7 +33,7 @@ class InfrastructureStack(Stack):
             destination_bucket=source_bucket,
         )
 
-        # Create VPC
+        # Create VPC with VPC Endpoints for Session Manager
         vpc = ec2.Vpc(
             self,
             "SimpleVPC",
@@ -48,28 +51,66 @@ class InfrastructureStack(Stack):
             ],
         )
 
-        # Create security group
-        security_group = ec2.SecurityGroup(
+        # Add VPC Endpoints for Session Manager
+        vpc.add_interface_endpoint(
+            "SSMEndpoint",
+            service=ec2.InterfaceVpcEndpointAwsService.SSM,
+        )
+        vpc.add_interface_endpoint(
+            "EC2MessagesEndpoint",
+            service=ec2.InterfaceVpcEndpointAwsService.EC2_MESSAGES,
+        )
+        vpc.add_interface_endpoint(
+            "SSMMessagesEndpoint",
+            service=ec2.InterfaceVpcEndpointAwsService.SSM_MESSAGES,
+        )
+
+        # Create security groups
+        alb_security_group = ec2.SecurityGroup(
             self,
-            "WebServerSG",
+            "ALBSecurityGroup",
             vpc=vpc,
             allow_all_outbound=True,
-            description="Security group for web server",
+            description="Security group for ALB",
         )
-
-        security_group.add_ingress_rule(
+        alb_security_group.add_ingress_rule(
             ec2.Peer.any_ipv4(), ec2.Port.tcp(80), "Allow HTTP traffic"
         )
-        security_group.add_ingress_rule(
-            ec2.Peer.any_ipv4(), ec2.Port.tcp(22), "Allow SSH traffic"
+
+        instance_security_group = ec2.SecurityGroup(
+            self,
+            "InstanceSecurityGroup",
+            vpc=vpc,
+            allow_all_outbound=True,
+            description="Security group for EC2 instances",
+        )
+        instance_security_group.add_ingress_rule(
+            ec2.Peer.security_group_id(alb_security_group.security_group_id),
+            ec2.Port.tcp(80),
+            "Allow traffic from ALB",
         )
 
-        # IAM role for EC2
+        # Create ALB
+        alb = elbv2.ApplicationLoadBalancer(
+            self,
+            "WebServerALB",
+            vpc=vpc,
+            internet_facing=True,
+            security_group=alb_security_group,
+        )
+
+        listener = alb.add_listener(
+            "Listener",
+            port=80,
+            open=True,
+        )
+
+        # Create IAM role for EC2 with Session Manager access
         role = iam.Role(
             self, "EC2Role", assumed_by=iam.ServicePrincipal("ec2.amazonaws.com")
         )
 
-        # Add permissions for ECR, CloudWatch and S3
+        # Add required policies
         role.add_managed_policy(
             iam.ManagedPolicy.from_aws_managed_policy_name(
                 "AmazonEC2ContainerRegistryFullAccess"
@@ -78,6 +119,11 @@ class InfrastructureStack(Stack):
         role.add_managed_policy(
             iam.ManagedPolicy.from_aws_managed_policy_name("CloudWatchLogsFullAccess")
         )
+        role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name(
+                "AmazonSSMManagedInstanceCore"
+            )
+        )
         role.add_to_policy(
             iam.PolicyStatement(
                 actions=["s3:GetObject", "s3:ListBucket"],
@@ -85,48 +131,81 @@ class InfrastructureStack(Stack):
             )
         )
 
-        # User data script to install and configure Docker
+        # User data script
         user_data = ec2.UserData.for_linux()
         user_data.add_commands(
-            # 安装基本工具
+            "exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1",
             "yum update -y",
             "yum install -y docker git aws-cli",
             "systemctl start docker",
             "systemctl enable docker",
             "usermod -a -G docker ec2-user",
-            # 创建应用目录
             "mkdir -p /app",
             "cd /app",
-            # 从S3下载源代码
             f"aws s3 cp s3://{source_bucket.bucket_name}/ . --recursive",
-            # 构建和运行Docker容器
-            "docker build -t backend-app .",
-            "docker run -d -p 80:80 backend-app",
+            "ls -la /app",
+            "docker build -t backend-app . || echo 'Docker build failed'",
+            "echo 'Starting container...'",
+            "docker run -d --name backend-app -p 80:80 backend-app || echo 'Docker run failed'",
+            "echo 'Container logs:'",
+            "sleep 5",
+            "docker ps",
+            "docker logs backend-app || echo 'No container logs available'",
+            "netstat -tulpn | grep LISTEN",
+            "curl -v http://localhost:80 || echo 'Failed to connect to localhost'",
         )
 
-        # Create EC2 instance
-        instance = ec2.Instance(
+        # Launch Template
+        launch_template = ec2.LaunchTemplate(
             self,
-            "WebServer",
-            vpc=vpc,
+            "WebServerTemplate",
             instance_type=ec2.InstanceType.of(
                 ec2.InstanceClass.T3, ec2.InstanceSize.SMALL
             ),
             machine_image=ec2.AmazonLinuxImage(
                 generation=ec2.AmazonLinuxGeneration.AMAZON_LINUX_2
             ),
-            security_group=security_group,
-            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
-            role=role,
             user_data=user_data,
+            role=role,
+            security_group=instance_security_group,
         )
 
-        # Output the public IP and bucket name
+        # ASG
+        asg = autoscaling.AutoScalingGroup(
+            self,
+            "WebServerASG",
+            vpc=vpc,
+            vpc_subnets=ec2.SubnetSelection(
+                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+            ),
+            launch_template=launch_template,
+            min_capacity=1,
+            max_capacity=4,
+            desired_capacity=2,
+            health_check=autoscaling.HealthCheck.elb(grace=Duration.seconds(180)),
+        )
+
+        # Add ASG to ALB target group
+        listener.add_targets(
+            "WebServerFleet",
+            port=80,
+            targets=[asg],
+            health_check=elbv2.HealthCheck(
+                path="/",
+                healthy_http_codes="200",
+                interval=Duration.seconds(30),
+                timeout=Duration.seconds(10),
+                healthy_threshold_count=2,
+                unhealthy_threshold_count=5,
+            ),
+        )
+
+        # Outputs
         CfnOutput(
             self,
-            "InstancePublicIP",
-            value=instance.instance_public_ip,
-            description="Public IP of the EC2 instance",
+            "LoadBalancerDNS",
+            value=alb.load_balancer_dns_name,
+            description="DNS name of the load balancer",
         )
         CfnOutput(
             self,
