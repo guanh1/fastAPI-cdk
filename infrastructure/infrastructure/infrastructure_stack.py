@@ -179,10 +179,21 @@ class InfrastructureStack(Stack):
                 subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
             ),
             launch_template=launch_template,
-            min_capacity=1,
-            max_capacity=4,
-            desired_capacity=2,
+            min_capacity=0,
+            max_capacity=1,
+            desired_capacity=0,
             health_check=autoscaling.HealthCheck.elb(grace=Duration.seconds(180)),
+        )
+        asg.scale_on_schedule(
+            "ScaleUpMorning",
+            schedule=autoscaling.Schedule.cron(hour="22", minute="0"),
+            desired_capacity=1,
+        )
+
+        asg.scale_on_schedule(
+            "ScaleDownEvening",
+            schedule=autoscaling.Schedule.cron(hour="10", minute="0"),
+            desired_capacity=0,
         )
 
         # Add ASG to ALB target group
