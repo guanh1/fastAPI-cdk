@@ -1,19 +1,18 @@
 from aws_cdk import (
     Stack,
     aws_ec2 as ec2,
+    aws_ecs as ecs,
     aws_iam as iam,
     aws_s3 as s3,
     aws_s3_deployment as s3deploy,
     aws_autoscaling as autoscaling,
-    aws_elasticloadbalancingv2 as elbv2,
-    Duration,
     CfnOutput,
     RemovalPolicy,
 )
 from constructs import Construct
 
 
-class InfrastructureStack(Stack):
+class TestStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
@@ -33,10 +32,10 @@ class InfrastructureStack(Stack):
             destination_bucket=source_bucket,
         )
 
-        # Create VPC with VPC Endpoints for Session Manager
+        # Create VPC
         vpc = ec2.Vpc(
             self,
-            "SimpleVPC",
+            "ECSClusterVPC",
             max_azs=2,
             nat_gateways=1,
             subnet_configuration=[
@@ -51,172 +50,141 @@ class InfrastructureStack(Stack):
             ],
         )
 
-        # Add VPC Endpoints for Session Manager
-        vpc.add_interface_endpoint(
-            "SSMEndpoint",
-            service=ec2.InterfaceVpcEndpointAwsService.SSM,
-        )
-        vpc.add_interface_endpoint(
-            "EC2MessagesEndpoint",
-            service=ec2.InterfaceVpcEndpointAwsService.EC2_MESSAGES,
-        )
-        vpc.add_interface_endpoint(
-            "SSMMessagesEndpoint",
-            service=ec2.InterfaceVpcEndpointAwsService.SSM_MESSAGES,
-        )
-
-        # Create security groups
-        alb_security_group = ec2.SecurityGroup(
+        # Create IAM role for EC2 instances
+        instance_role = iam.Role(
             self,
-            "ALBSecurityGroup",
-            vpc=vpc,
-            allow_all_outbound=True,
-            description="Security group for ALB",
-        )
-        alb_security_group.add_ingress_rule(
-            ec2.Peer.any_ipv4(), ec2.Port.tcp(80), "Allow HTTP traffic"
-        )
-
-        instance_security_group = ec2.SecurityGroup(
-            self,
-            "InstanceSecurityGroup",
-            vpc=vpc,
-            allow_all_outbound=True,
-            description="Security group for EC2 instances",
-        )
-        instance_security_group.add_ingress_rule(
-            ec2.Peer.security_group_id(alb_security_group.security_group_id),
-            ec2.Port.tcp(80),
-            "Allow traffic from ALB",
+            "ECSInstanceRole",
+            assumed_by=iam.ServicePrincipal("ec2.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AmazonEC2ContainerServiceforEC2Role"
+                ),
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "AmazonSSMManagedInstanceCore"
+                ),
+            ],
         )
 
-        # Create ALB
-        alb = elbv2.ApplicationLoadBalancer(
-            self,
-            "WebServerALB",
-            vpc=vpc,
-            internet_facing=True,
-            security_group=alb_security_group,
-        )
-
-        listener = alb.add_listener(
-            "Listener",
-            port=80,
-            open=True,
-        )
-
-        # Create IAM role for EC2 with Session Manager access
-        role = iam.Role(
-            self, "EC2Role", assumed_by=iam.ServicePrincipal("ec2.amazonaws.com")
-        )
-
-        # Add required policies
-        role.add_managed_policy(
-            iam.ManagedPolicy.from_aws_managed_policy_name(
-                "AmazonEC2ContainerRegistryFullAccess"
-            )
-        )
-        role.add_managed_policy(
-            iam.ManagedPolicy.from_aws_managed_policy_name("CloudWatchLogsFullAccess")
-        )
-        role.add_managed_policy(
-            iam.ManagedPolicy.from_aws_managed_policy_name(
-                "AmazonSSMManagedInstanceCore"
-            )
-        )
-        role.add_to_policy(
+        # Add S3 access to instance role
+        instance_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["s3:GetObject", "s3:ListBucket"],
                 resources=[source_bucket.bucket_arn, f"{source_bucket.bucket_arn}/*"],
             )
         )
 
-        # User data script
-        user_data = ec2.UserData.for_linux()
-        user_data.add_commands(
-            "exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1",
-            "yum update -y",
-            "yum install -y docker git aws-cli",
-            "systemctl start docker",
-            "systemctl enable docker",
-            "usermod -a -G docker ec2-user",
-            "mkdir -p /app",
-            "cd /app",
-            f"aws s3 cp s3://{source_bucket.bucket_name}/ . --recursive",
-            "ls -la /app",
-            "docker build -t backend-app . || echo 'Docker build failed'",
-            "echo 'Starting container...'",
-            "docker run -d --name backend-app -p 80:80 backend-app || echo 'Docker run failed'",
-            "echo 'Container logs:'",
-            "sleep 5",
-            "docker ps",
-            "docker logs backend-app || echo 'No container logs available'",
-            "netstat -tulpn | grep LISTEN",
-            "curl -v http://localhost:80 || echo 'Failed to connect to localhost'",
+        # Create security group for ECS instances
+        instance_sg = ec2.SecurityGroup(
+            self,
+            "ECSInstanceSG",
+            vpc=vpc,
+            allow_all_outbound=True,
+            description="Security group for ECS instances",
         )
 
-        # Launch Template
+        # Create ECS Cluster
+        cluster = ecs.Cluster(
+            self,
+            "ECSCluster",
+            vpc=vpc,
+        )
+
+        # User data for ECS instance to build and push container image
+        user_data = ec2.UserData.for_linux()
+        user_data.add_commands(
+            "echo 'ECS_CLUSTER=" + cluster.cluster_name + "' >> /etc/ecs/ecs.config",
+            "systemctl start ecs",
+            "systemctl enable ecs",
+        )
+
+        # Create Launch Template
         launch_template = ec2.LaunchTemplate(
             self,
-            "WebServerTemplate",
+            "ECSLaunchTemplate",
             instance_type=ec2.InstanceType.of(
                 ec2.InstanceClass.T3, ec2.InstanceSize.SMALL
             ),
-            machine_image=ec2.AmazonLinuxImage(
-                generation=ec2.AmazonLinuxGeneration.AMAZON_LINUX_2
+            machine_image=ec2.MachineImage.from_ssm_parameter(
+                "/aws/service/ecs/optimized-ami/amazon-linux-2/ami-0015e288e8871864a",
+                os=ec2.OperatingSystemType.LINUX,
             ),
+            role=instance_role,
+            security_group=instance_sg,
             user_data=user_data,
-            role=role,
-            security_group=instance_security_group,
         )
 
-        # ASG
+        # Create Auto Scaling Group
         asg = autoscaling.AutoScalingGroup(
             self,
-            "WebServerASG",
+            "ECSASG",
             vpc=vpc,
             vpc_subnets=ec2.SubnetSelection(
                 subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
             ),
             launch_template=launch_template,
-            min_capacity=0,
-            max_capacity=1,
-            desired_capacity=0,
-            health_check=autoscaling.HealthCheck.elb(grace=Duration.seconds(180)),
-        )
-        asg.scale_on_schedule(
-            "ScaleUpMorning",
-            schedule=autoscaling.Schedule.cron(hour="22", minute="0"),
-            desired_capacity=1,
+            min_capacity=1,
+            max_capacity=3,
+            desired_capacity=2,
         )
 
-        asg.scale_on_schedule(
-            "ScaleDownEvening",
-            schedule=autoscaling.Schedule.cron(hour="10", minute="0"),
-            desired_capacity=0,
+        # Add ASG Capacity Provider
+        capacity_provider = ecs.AsgCapacityProvider(
+            self,
+            "AsgCapacityProvider",
+            auto_scaling_group=asg,
+            enable_managed_termination_protection=False,
+        )
+        cluster.add_asg_capacity_provider(capacity_provider)
+
+        # Create Task Definition
+        task_definition = ecs.Ec2TaskDefinition(
+            self,
+            "TaskDef",
+            network_mode=ecs.NetworkMode.BRIDGE,
         )
 
-        # Add ASG to ALB target group
-        listener.add_targets(
-            "WebServerFleet",
-            port=80,
-            targets=[asg],
-            health_check=elbv2.HealthCheck(
-                path="/",
-                healthy_http_codes="200",
-                interval=Duration.seconds(30),
-                timeout=Duration.seconds(10),
-                healthy_threshold_count=2,
-                unhealthy_threshold_count=5,
-            ),
+        # Add container to task definition using locally built image
+        container = task_definition.add_container(
+            "BackendContainer",
+            image=ecs.ContainerImage.from_registry("54hg0220/test-backend-api"),
+            memory_limit_mib=512,
+            cpu=256,
+            logging=ecs.LogDrivers.aws_logs(stream_prefix="BackendContainer"),
+        )
+
+        container.add_port_mappings(
+            ecs.PortMapping(container_port=80, host_port=80, protocol=ecs.Protocol.TCP)
+        )
+
+        # Create ECS Service
+        service = ecs.Ec2Service(
+            self,
+            "BackendService",
+            cluster=cluster,
+            task_definition=task_definition,
+            desired_count=2,
+            min_healthy_percent=50,
+            max_healthy_percent=200,
+            capacity_provider_strategies=[
+                ecs.CapacityProviderStrategy(
+                    capacity_provider=capacity_provider.capacity_provider_name,
+                    weight=1,
+                )
+            ],
         )
 
         # Outputs
         CfnOutput(
             self,
-            "LoadBalancerDNS",
-            value=alb.load_balancer_dns_name,
-            description="DNS name of the load balancer",
+            "ClusterName",
+            value=cluster.cluster_name,
+            description="Name of the ECS Cluster",
+        )
+        CfnOutput(
+            self,
+            "ServiceName",
+            value=service.service_name,
+            description="Name of the ECS Service",
         )
         CfnOutput(
             self,

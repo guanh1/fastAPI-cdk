@@ -3,10 +3,10 @@ import os  # noqa: F401
 
 import aws_cdk as cdk
 
-from infrastructure.infrastructure_stack import InfrastructureStack
+from infrastructure.infrastructure_stack import TestStack
 
 
 app = cdk.App()
-InfrastructureStack(app, "FastApiCdkStack")
+TestStack(app, "TestStack")
 
 app.synth()
